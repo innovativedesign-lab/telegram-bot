@@ -224,6 +224,12 @@ export interface BotConfig extends StellarConfig {
   deadLetterMax: number;
   /** Replay attempts before a parked send is dropped as poison. */
   deadLetterMaxAttempts: number;
+  /**
+   * Crash-safe send journal: intent is logged before a Telegram send and done
+   * after, so a restart can tell which notifications may have been sent
+   * (see src/notifications/send-journal.ts). Empty disables the journal.
+   */
+  sendJournalFile: string;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -312,6 +318,7 @@ const DEFAULTS = {
   deadLetterFile: "./data/dead-letter.json",
   deadLetterMax: 100,
   deadLetterMaxAttempts: 10,
+  sendJournalFile: "./data/send-journal.jsonl",
   healthHost: "127.0.0.1",
   healthPort: 8787,
   // 3Ã— default poll interval â€” one missed cycle is fine; three is not.
@@ -734,6 +741,10 @@ export function loadConfig(): BotConfig {
       DEFAULTS.deadLetterMaxAttempts,
       1,
     ),
+    sendJournalFile: path.resolve(
+      process.cwd(),
+      read("SEND_JOURNAL_FILE") ?? DEFAULTS.sendJournalFile,
+    ),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).
     healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
@@ -885,6 +896,7 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "STATUS_FILE", secret: false, hasBuiltInDefault: true },
   { key: "MAX_NOTIFICATIONS_PER_CYCLE", secret: false, hasBuiltInDefault: true },
   { key: "AUDIT_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "SEND_JOURNAL_FILE", secret: false, hasBuiltInDefault: true },
   { key: "EVENT_DEDUP_WINDOW", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_HOST", secret: false, hasBuiltInDefault: true },
   {

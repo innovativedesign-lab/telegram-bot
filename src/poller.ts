@@ -52,7 +52,7 @@
  * the only resume token, in the same `version: 1` format as before.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, rename, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
@@ -69,6 +69,10 @@ import {
   DEAD_LETTER_MAX_ENTRIES,
   type DeadLetterStats,
 } from "./deadLetter.js";
+import {
+  createSendJournal,
+  type SendJournal,
+} from "./notifications/send-journal.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -1252,6 +1256,20 @@ export function createPoller(deps: PollerDeps) {
     now,
   });
 
+  /** Crash-safe send journal: intent before a send, done after. */
+  const sendJournalEnabled =
+    typeof config.sendJournalFile === "string" && config.sendJournalFile.length > 0;
+  let sendJournal: SendJournal | null = null;
+  if (sendJournalEnabled) {
+    sendJournal = createSendJournal({
+      filePath: config.sendJournalFile,
+      now,
+    });
+  }
+
+  /** Event ids that may already have been sent (crash recovery); never re-notified. */
+  const maybeSent = new Set<string>();
+
   /** Mirror the queue's counters into the status this poller reports. */
   function refreshDeadLetterStatus(): void {
     status.deadLetter = deadLetter.stats();
@@ -1759,6 +1777,45 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
+      // Crash recovery: an event that may already have been sent is treated as
+      // committed (the existing lossy cursor-commit policy) so a crash between
+      // sendMessage and the cursor commit never duplicates a notification.
+      if (sendJournal && maybeSent.has(event.eventId)) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        try {
+          await sendJournal.recordDone(event.eventId);
+        } catch (err) {
+          console.error(
+            `[poller] send journal done failed for ${event.eventId}: ${safeErrorMessage(err)}`,
+          );
+        }
+        continue;
+      }
+
+      // Record intent before the send so a crash between sendMessage and the
+      // cursor commit is detectable on restart instead of guessed at.
+      if (sendJournal) {
+        try {
+          const textHash = createHash("sha256")
+            .update(text)
+            .digest("hex")
+            .slice(0, 16);
+          await sendJournal.recordIntent({
+            id: event.eventId,
+            source: event.source,
+            ledger: event.ledger,
+            eventName: event.payload.name,
+            textHash,
+            at: now(),
+          });
+        } catch (err) {
+          console.error(
+            `[poller] send journal intent failed for ${event.eventId}: ${safeErrorMessage(err)}`,
+          );
+        }
+      }
+
       try {
         // Use bounded retry for Telegram sends to handle transient failures
         await sendWithRetry(
@@ -1772,6 +1829,15 @@ export function createPoller(deps: PollerDeps) {
         status.notificationsSent += 1;
         metrics?.notificationsSent.inc();
         sentThisCycle += 1;
+        if (sendJournal) {
+          try {
+            await sendJournal.recordDone(event.eventId);
+          } catch (err) {
+            console.error(
+              `[poller] send journal done failed for ${event.eventId}: ${safeErrorMessage(err)}`,
+            );
+          }
+        }
       } catch (err) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
@@ -2432,6 +2498,18 @@ export function createPoller(deps: PollerDeps) {
       // Parked sends from the previous run are part of this run's work.
       await deadLetter.load();
       refreshDeadLetterStatus();
+
+      // Recover which notifications may already have been sent: an intent
+      // without a matching done means a crash happened between sendMessage and
+      // the cursor commit. Treat them as committed so a restart never duplicates
+      // them (the existing lossy cursor-commit policy).
+      if (sendJournal) {
+        for (const entry of await sendJournal.loadPending()) {
+          maybeSent.add(entry.id);
+        }
+        await sendJournal.compact();
+      }
+
       stopped = false;
       paused = false;
       status.paused = false;
