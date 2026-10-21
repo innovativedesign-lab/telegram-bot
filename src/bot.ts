@@ -42,6 +42,14 @@ import {
   PAUSE_MESSAGES,
   RESUME_MESSAGES,
 } from "./i18n.js";
+import {
+  canSendHint,
+  clearHintState,
+  closestCommand,
+  recordHint,
+  unknownCommandReply,
+} from "./commands/unknown.js";
+export { clearHintState } from "./commands/unknown.js";
 
 /** Shared metadata for handlers, help, and Telegram's command menu. */
 const COMMANDS = [
@@ -699,6 +707,58 @@ export function registerCommandHandlers(
   for (const { command } of COMMANDS) {
     bot.command(command, handlers[command]);
   }
+
+  // ── Unknown-command fallback (private chats only) ──────────────────────
+  // Must be registered AFTER all known commands so grammy's command middleware
+  // matches known ones first. Only fires in private chats; groups and channels
+  // are left silent. Commands addressed to another bot (/cmd@otherbot) are
+  // skipped because the entity's text will include the @mention and the
+  // extracted command name won't match our COMMANDS list — we double-check
+  // the botInfo username to be explicit.
+  const knownCommandNames = COMMANDS.map((c) => c.command);
+
+  (bot as unknown as Bot).on("message:entities:bot_command", async (ctx: Context) => {
+    // Private chats only.
+    if (ctx.chat?.type !== "private") return;
+
+    const text = ctx.message?.text ?? "";
+    const entities = ctx.message?.entities ?? [];
+
+    // Find the first bot_command entity at offset 0.
+    const cmdEntity = entities.find(
+      (e) => e.type === "bot_command" && e.offset === 0,
+    );
+    if (!cmdEntity) return;
+
+    // Extract the raw command token, e.g. "/status@mybot" → "status@mybot".
+    const raw = text.slice(1, cmdEntity.length); // strip leading /
+    const atIndex = raw.indexOf("@");
+    const cmdName = atIndex === -1 ? raw : raw.slice(0, atIndex);
+    const mention = atIndex === -1 ? null : raw.slice(atIndex + 1);
+
+    // If it targets another bot, ignore.
+    if (mention !== null) {
+      const myUsername = (ctx as unknown as { me?: { username?: string } }).me?.username;
+      if (myUsername && mention.toLowerCase() !== myUsername.toLowerCase()) return;
+    }
+
+    // Already handled by a known-command handler — do nothing.
+    if (knownCommandNames.includes(cmdName)) return;
+
+    // Rate-limit: one hint per chat per HINT_COOLDOWN_MS.
+    const chatId = ctx.chat.id;
+    if (!canSendHint(chatId)) return;
+
+    const suggestion = closestCommand(cmdName, knownCommandNames);
+    const reply = unknownCommandReply(cmdName, suggestion);
+
+    try {
+      await ctx.reply(reply);
+      recordHint(chatId);
+    } catch (err) {
+      console.warn(`[bot] unknown-command hint failed: ${safeErrorMessage(err, [config.botToken])}`);
+    }
+  });
 }
 
 function isMessageNotModified(err: unknown): boolean {
