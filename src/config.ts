@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Environment loading and validation.
  *
  * Fails fast and LOUDLY: a notifier that boots with a missing chat id or a
@@ -51,6 +51,7 @@ import {
   parseNotificationFeatureFlags,
   type NotificationFeatureFlags,
 } from "./notifications/featureFlags.js";
+import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -194,6 +195,8 @@ export interface BotConfig extends StellarConfig {
   pollIntervalMs: number;
   startLookbackLedgers: number;
   cursorFile: string;
+  /** Persisted poller counters across restarts. */
+  countersFile?: string;
   /** Exclusive lock so only one process owns the cursor. */
   lockFile: string;
   statusFile: string;
@@ -204,6 +207,8 @@ export interface BotConfig extends StellarConfig {
   metricsPort: number | null;
   /** Optional allowlist of claim categories to notify about. Empty means allow all. */
   notificationCategories: readonly string[];
+  /** Event names sent without a notification sound (SILENT_EVENTS). */
+  silentEvents: readonly string[];
   /** Path for the standalone scanner's CSV output (see CSV_OUTPUT_FILE). */
   csvOutputFile: string;
   /** Coarse notification feature flags (see NOTIFY_* env vars). */
@@ -224,6 +229,12 @@ export interface BotConfig extends StellarConfig {
   deadLetterMax: number;
   /** Replay attempts before a parked send is dropped as poison. */
   deadLetterMaxAttempts: number;
+  /**
+   * Crash-safe send journal: intent is logged before a Telegram send and done
+   * after, so a restart can tell which notifications may have been sent
+   * (see src/notifications/send-journal.ts). Empty disables the journal.
+   */
+  sendJournalFile: string;
   /** Loopback host for the local HTTP health endpoint. */
   healthHost: string;
   /** TCP port for the health endpoint. `0` disables the listener. */
@@ -254,23 +265,8 @@ export interface BotConfig extends StellarConfig {
   sendTimeoutMs?: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
-  /** Show Telegram link previews on market notifications (LINK_PREVIEW_MARKET). */
-  linkPreviewMarket: boolean;
-  /** Show Telegram link previews on squad notifications (LINK_PREVIEW_SQUAD). */
-  linkPreviewSquad: boolean;
-  /** Per-chat notification preferences. Optional; absent means the single chat route. */
-  routes?: TelegramRoute[];
-  /**
-   * Identical RPC/poller error lines allowed per key per sampling window.
-   * Repeats beyond this are counted and reported as one summary line.
-   */
-  logSampleMaxPerWindow: number;
-  /** Sampling window for repetitive error logs, in milliseconds. */
-  logSampleWindowMs: number;
-  /** Recent console lines kept (redacted) for /export. `0` disables capture. */
-  logBufferLines: number;
-  /** Optional public URL to run the bot in webhook mode instead of long-polling. */
-  telegramWebhookUrl: string | null;
+  /** Optional bearer token for health endpoint authentication. Null disables auth. */
+  healthAuthToken: string | null;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
@@ -302,6 +298,7 @@ const DEFAULTS = {
   minPollIntervalMs: 5_000,
   startLookbackLedgers: 60,
   cursorFile: "./data/cursor.json",
+  countersFile: "./data/counters.json",
   lockFile: "./data/poller.lock",
   statusFile: "./data/status.json",
   maxNotificationsPerCycle: 20,
@@ -312,6 +309,7 @@ const DEFAULTS = {
   deadLetterFile: "./data/dead-letter.json",
   deadLetterMax: 100,
   deadLetterMaxAttempts: 10,
+  sendJournalFile: "./data/send-journal.jsonl",
   healthHost: "127.0.0.1",
   healthPort: 8787,
   // 3Ã— default poll interval â€” one missed cycle is fine; three is not.
@@ -395,6 +393,68 @@ function read(name: string): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
+/**
+ * Telegram bot token shape: `<digits>:<35+ url-safe chars>`.
+ *
+ * The id part is numeric and the secret part is base64url-ish (`A-Za-z0-9_-`).
+ * Real tokens are ~46 chars total, but the secret length has grown over time,
+ * so only a lower bound is enforced.
+ */
+const BOT_TOKEN_RE = /^\d+:[A-Za-z0-9_-]{35,}$/;
+
+/** Characters that suggest a value was pasted with surrounding quotes. */
+const QUOTE_CHARS = new Set(['"', "'", "`", "\u2018", "\u2019", "\u201C", "\u201D"]);
+
+/**
+ * Explains why `BOT_TOKEN` is not a valid token, without echoing any part of
+ * it. Returns `null` when the value is well-formed.
+ *
+ * The message names the *kind* of problem (quotes, whitespace, missing colon,
+ * wrong shape) so an operator can fix it in one pass, but never includes a
+ * character of the token itself.
+ */
+function describeBotTokenProblem(raw: string): string | null {
+  if (BOT_TOKEN_RE.test(raw)) return null;
+
+  const trimmed = raw.trim();
+  const hasSurroundingWhitespace = trimmed !== raw;
+  const hasSurroundingQuotes =
+    raw.length >= 2 &&
+    QUOTE_CHARS.has(raw[0]!) &&
+    QUOTE_CHARS.has(raw[raw.length - 1]!);
+  const hasInnerWhitespace = /\s/.test(trimmed);
+
+  const hints: string[] = [];
+  if (hasSurroundingQuotes) {
+    hints.push("it is wrapped in quotes — paste the token without them");
+  }
+  if (hasSurroundingWhitespace) {
+    hints.push("it has leading or trailing whitespace — trim it");
+  }
+  if (hasInnerWhitespace) {
+    hints.push("it contains whitespace inside the value");
+  }
+
+  const colonIndex = trimmed.indexOf(":");
+  if (colonIndex === -1) {
+    hints.push("it is missing the ':' separator between the id and the secret");
+  } else if (colonIndex === 0 || colonIndex === trimmed.length - 1) {
+    hints.push("the ':' separator must sit between the id and the secret");
+  } else if (!/^\d+$/.test(trimmed.slice(0, colonIndex))) {
+    hints.push("the part before ':' must be the numeric bot id");
+  } else if (!/^[A-Za-z0-9_-]{35,}$/.test(trimmed.slice(colonIndex + 1))) {
+    hints.push(
+      "the part after ':' must be at least 35 url-safe characters (A-Z, a-z, 0-9, '_', '-')",
+    );
+  }
+
+  if (hints.length === 0) {
+    hints.push("it does not match the expected <digits>:<35+ url-safe chars> shape");
+  }
+
+  return `BOT_TOKEN is not a valid Telegram bot token: ${hints.join("; ")}`;
+}
+
 function collector(profile: Record<string, string>) {
   const problems: string[] = [];
   /** Environment first, then the active profile's defaults. */
@@ -411,6 +471,19 @@ function collector(profile: Record<string, string>) {
         problems.push(`${name} is required but not set`);
         return "";
       }
+      return value;
+    },
+
+    /**
+     * Validates `BOT_TOKEN` shape at load time so a quoted or padded paste
+     * fails fast with a clear message instead of surfacing as a `getMe`
+     * failure at startup. The message never includes any part of the token.
+     */
+    botToken(name: string): string {
+      const value = this.required(name);
+      if (value === "") return value;
+      const problem = describeBotTokenProblem(value);
+      if (problem !== null) problems.push(problem);
       return value;
     },
 
@@ -458,6 +531,56 @@ function collector(profile: Record<string, string>) {
         }
       } catch {
         problems.push(`${name} is not a valid URL; got "${value}"`);
+      }
+      return value;
+    },
+
+    /**
+     * Optional dev-only Telegram Bot API root. Must be a loopback http URL so a
+     * misconfigured deployment can never silently route traffic to a fake.
+     */
+    loopbackApiRoot(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        problems.push(`${name} is not a valid URL; got "${value}"`);
+        return null;
+      }
+      if (parsed.protocol !== "http:") {
+        problems.push(`${name} must use http:// (loopback only); got "${value}"`);
+        return null;
+      }
+      const host = parsed.hostname;
+      if (host !== "127.0.0.1" && host !== "localhost") {
+        problems.push(
+          `${name} must point at 127.0.0.1 or localhost (dev only); got "${value}"`,
+        );
+        return null;
+      }
+      return value;
+    },
+
+    /**
+     * Parse an optional https-only URL. Returns `null` when unset, and also
+     * when the value is unusable — a Telegram button must never carry an
+     * off-site or plain-http origin, so the problem is reported and the link
+     * stays disabled instead of being downgraded.
+     */
+    optionalHttpsUrl(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== "https:") {
+          problems.push(`${name} must be an https URL; got "${value}"`);
+          return null;
+        }
+      } catch {
+        problems.push(`${name} is not a valid URL; got "${value}"`);
+        return null;
       }
       return value;
     },
@@ -583,17 +706,14 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
-    network(name: string, fallback: StellarNetwork): StellarNetwork {
-      const value = get(name);
-      if (value === undefined) return fallback;
-      const valid: StellarNetwork[] = ["testnet", "mainnet", "futurenet", "custom"];
-      if (!valid.includes(value as StellarNetwork)) {
-        problems.push(
-          `${name} must be one of ${valid.join(", ")}; got "${value}"`,
-        );
-        return fallback;
-      }
-      return value as StellarNetwork;
+    /**
+     * Parses an optional secret value. Returns null when unset.
+     * Used for authentication tokens that should be redacted in logs.
+     */
+    optionalSecret(name: string): string | null {
+      const value = read(name);
+      if (value === undefined) return null;
+      return value;
     },
   };
 }
@@ -625,6 +745,19 @@ function notificationCategoriesFrom(): readonly string[] {
 
   if (envValues.length === 0) return [];
   return parseNotificationCategories(envValues.join(","));
+}
+
+function silentEventsFrom(c: ReturnType<typeof collector>): readonly string[] {
+  const raw = c.get("SILENT_EVENTS");
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SILENT_EVENTS;
+
+  const entries = [...new Set(raw.split(",").map((value) => value.trim()).filter(Boolean))];
+  for (const entry of entries) {
+    if (!(KNOWN_EVENT_NAMES as readonly string[]).includes(entry)) {
+      c.problems.push(`SILENT_EVENTS contains unknown event name "${entry}"`);
+    }
+  }
+  return entries;
 }
 
 function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
@@ -697,7 +830,7 @@ export function loadConfig(): BotConfig {
   const config: BotConfig = {
     ...stellar,
     version: APP_VERSION,
-    botToken: c.required("BOT_TOKEN"),
+    botToken: c.botToken("BOT_TOKEN"),
     chatId: chatIds[0] ?? "",
     chatIds,
     marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
@@ -707,6 +840,7 @@ export function loadConfig(): BotConfig {
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
     startLookbackLedgers: c.int("START_LOOKBACK_LEDGERS", DEFAULTS.startLookbackLedgers, 0),
     cursorFile: path.resolve(process.cwd(), c.get("CURSOR_FILE") ?? DEFAULTS.cursorFile),
+    countersFile: path.resolve(process.cwd(), c.get("COUNTERS_FILE") ?? DEFAULTS.countersFile),
     lockFile: path.resolve(process.cwd(), read("INSTANCE_LOCK_FILE") ?? DEFAULTS.lockFile),
     statusFile: path.resolve(process.cwd(), c.get("STATUS_FILE") ?? DEFAULTS.statusFile),
     maxNotificationsPerCycle: c.int(
@@ -717,6 +851,7 @@ export function loadConfig(): BotConfig {
     interSendDelayMs: c.int("INTER_SEND_DELAY_MS", DEFAULTS.interSendDelayMs, 0),
     metricsPort: c.optionalPort("METRICS_PORT"),
     notificationCategories: notificationCategoriesFrom(),
+    silentEvents: silentEventsFrom(c),
     csvOutputFile: path.resolve(process.cwd(), c.get("CSV_OUTPUT_FILE") ?? DEFAULTS.csvOutputFile),
     featureFlags: featureFlagsParsed.flags,
     // Resolved like the cursor file: relative paths anchor to the process cwd.
@@ -733,6 +868,10 @@ export function loadConfig(): BotConfig {
       "DEAD_LETTER_MAX_ATTEMPTS",
       DEFAULTS.deadLetterMaxAttempts,
       1,
+    ),
+    sendJournalFile: path.resolve(
+      process.cwd(),
+      read("SEND_JOURNAL_FILE") ?? DEFAULTS.sendJournalFile,
     ),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).
@@ -756,24 +895,35 @@ export function loadConfig(): BotConfig {
       0,
     ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
-    linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
-    linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
-    logSampleMaxPerWindow: c.int(
-      "LOG_SAMPLE_MAX_PER_WINDOW",
-      DEFAULTS.logSampleMaxPerWindow,
-      1,
-    ),
-    // A window of 1ms is legal but pointless; 1s is the smallest useful unit.
-    logSampleWindowMs: c.int("LOG_SAMPLE_WINDOW_MS", DEFAULTS.logSampleWindowMs, 1_000),
-    logBufferLines: c.int("LOG_BUFFER_LINES", DEFAULTS.logBufferLines, 0),
-    telegramWebhookUrl: c.optionalUrl("TELEGRAM_WEBHOOK_URL"),
+    healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);
+
+  // Warn if health endpoint is exposed beyond loopback without authentication.
+  if (config.healthPort !== 0 && !isLoopback(config.healthHost) && config.healthAuthToken === null) {
+    console.warn(
+      `[config] HEALTH_HOST=${config.healthHost} is non-loopback but HEALTH_AUTH_TOKEN is not set. ` +
+        `Health and metrics will be accessible without authentication. ` +
+        `Set HEALTH_AUTH_TOKEN to protect these endpoints.`,
+    );
+  }
+
   return config;
 }
 
-/** Display label for the active Stellar network. */
+/** Check if a host is a loopback address (127.0.0.1, [::1], localhost). */
+function isLoopback(host: string): boolean {
+  const normalized = host.toLowerCase();
+  return (
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized === "localhost" ||
+    normalized.startsWith("127.")
+  );
+}
+
+/** `mock` / `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
 export function networkLabel(config: StellarConfig): string {
   // A named STELLAR_NETWORK is reported by the name the operator chose.
   if (config.network !== undefined && config.network !== "custom") return config.network;
@@ -847,7 +997,7 @@ export interface ConfigProvenance {
   warnings: string[];
 }
 
-interface ConfigKeySpec {
+export interface ConfigKeySpec {
   key: string;
   /** The value must never reach a log line, a health response, or an error. */
   secret: boolean;
@@ -862,10 +1012,13 @@ interface ConfigKeySpec {
  * report that lists keys the process never reads would be noise, and one that
  * omits a key it does read would be a lie.
  */
-const CONFIG_KEYS: readonly ConfigKeySpec[] = [
+export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "MIMIR_PROFILE", secret: false },
   { key: "MARKET_CONTRACT_ID", secret: false },
   { key: "SQUAD_CONTRACT_ID", secret: false },
+  { key: "MARKET_CONTRACT_VERSION", secret: false, hasBuiltInDefault: true },
+  { key: "SQUAD_CONTRACT_VERSION", secret: false, hasBuiltInDefault: true },
+  { key: "STELLAR_NETWORK", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_RPC_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
@@ -884,8 +1037,18 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "INSTANCE_LOCK_FILE", secret: false, hasBuiltInDefault: true },
   { key: "STATUS_FILE", secret: false, hasBuiltInDefault: true },
   { key: "MAX_NOTIFICATIONS_PER_CYCLE", secret: false, hasBuiltInDefault: true },
+  { key: "INTER_SEND_DELAY_MS", secret: false, hasBuiltInDefault: true },
+  { key: "METRICS_PORT", secret: false },
+  { key: "NOTIFY_ENABLED", secret: false, hasBuiltInDefault: true },
+  { key: "NOTIFY_MARKET", secret: false, hasBuiltInDefault: true },
+  { key: "NOTIFY_SQUAD", secret: false, hasBuiltInDefault: true },
+  { key: "SILENT_EVENTS", secret: false, hasBuiltInDefault: true },
   { key: "AUDIT_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "SEND_JOURNAL_FILE", secret: false, hasBuiltInDefault: true },
   { key: "EVENT_DEDUP_WINDOW", secret: false, hasBuiltInDefault: true },
+  { key: "DEAD_LETTER_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "DEAD_LETTER_MAX", secret: false, hasBuiltInDefault: true },
+  { key: "DEAD_LETTER_MAX_ATTEMPTS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_HOST", secret: false, hasBuiltInDefault: true },
   {
     key: "HEALTH_PORT",
@@ -902,11 +1065,17 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
     },
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "STARTUP_HEALTH_DEADLINE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },
+  { key: "LOG_SAMPLE_MAX_PER_WINDOW", secret: false, hasBuiltInDefault: true },
+  { key: "LOG_SAMPLE_WINDOW_MS", secret: false, hasBuiltInDefault: true },
+  { key: "TELEGRAM_API_ROOT", secret: false },
+  { key: "MIMIR_APP_URL", secret: false },
   // Injected by a platform, never set by an operator: read only as the
   // HEALTH_PORT fallback, so it is reported for the same reason.
   { key: "PORT", secret: false },

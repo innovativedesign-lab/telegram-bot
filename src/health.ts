@@ -8,6 +8,7 @@
  * to publish is where it came from.
  */
 
+import crypto from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -116,6 +117,10 @@ export interface HealthReport {
       version: string;
       /** Public contract id (on-chain). */
       contractId: string;
+      /** Duration of this target's most recent attempted cycle. */
+      lastCycleMs: number;
+      /** Longest attempted cycle for this target since process start. */
+      maxCycleMs: number;
       lastEventLedger: number | null;
       /** Opaque resume cursor; not a secret. Truncated for readability. */
       cursorPreview: string | null;
@@ -151,6 +156,30 @@ const CURSOR_PREVIEW_LEN = 24;
 
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
+}
+
+/**
+ * Constant-time comparison for bearer token authentication.
+ * Prevents timing attacks that could reveal the token.
+ */
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+/**
+ * Extract and validate the bearer token from the Authorization header.
+ * Returns true if the token matches the expected value (or if auth is disabled).
+ */
+function isValidAuth(authHeader: string | undefined, expectedToken: string | null): boolean {
+  if (expectedToken === null) return true;
+  if (authHeader === undefined) return false;
+
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match || match[1] === undefined) return false;
+
+  const providedToken = match[1];
+  return constantTimeEquals(providedToken, expectedToken);
 }
 
 function previewCursor(cursor: string | null): string | null {
@@ -297,6 +326,8 @@ export function buildHealthReport(
         source: t.source,
         version: t.version ?? "v1",
         contractId: t.contractId,
+        lastCycleMs: t.lastCycleMs ?? 0,
+        maxCycleMs: t.maxCycleMs ?? 0,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
         gapLedgers: typeof t.gapLedgers === "number" ? t.gapLedgers : 0,
@@ -396,6 +427,15 @@ function sendJson(
   res.end(payload);
 }
 
+function sendUnauthorized(res: http.ServerResponse): void {
+  res.writeHead(401, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": "0",
+  });
+  res.end();
+}
+
 /**
  * Start the local health HTTP server.
  *
@@ -416,8 +456,9 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
-    if (deps.webhookHandler && method === "POST" && url.pathname === "/telegram-webhook") {
-      deps.webhookHandler(req, res);
+    // Check authentication for all routes when token is configured
+    if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
+      sendUnauthorized(res);
       return;
     }
 

@@ -1,0 +1,290 @@
+/**
+ * Tests for the /pause + callback-query infrastructure in bot.ts.
+ *
+ * Covers:
+ *   - validateCallbackData: known actions, unknown actions, edge cases
+ *   - operatorKeyboard: button shape and byte limits
+ *   - handleCallbackQuery: pause, resume, non-operator, invalid data
+ *   - /pause command: operator vs non-operator
+ *   - CALLBACK_PAUSE_CONFIRM/CANCEL byte-length contract
+ */
+
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  handleCallbackQuery,
+  validatePauseCallbackData,
+  pauseConfirmationKeyboard,
+  CALLBACK_PAUSE_CONFIRM,
+  CALLBACK_PAUSE_CANCEL,
+  PAUSE_CONFIRM_TTL_MS,
+  TELEGRAM_CALLBACK_DATA_MAX_BYTES,
+  CALLBACK_FALLBACK_FEEDBACK,
+  registerCommandHandlers,
+} from "../dist/bot.js";
+
+function baseConfig(overrides = {}) {
+  return {
+    marketContractId: "C" + "A".repeat(55),
+    squadContractId: "C" + "B".repeat(55),
+    rpcUrl: "https://example.invalid/rpc",
+    horizonUrl: "https://example.invalid/horizon",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    explorerBaseUrl: "https://example.invalid/explorer",
+    botToken: "123456789:TEST-ONLY-TOKEN-NEVER-USE",
+    chatId: "-1001234567890",
+    allowedChatIds: [],
+    operatorTelegramUserId: "42",
+    pollIntervalMs: 30_000,
+    startLookbackLedgers: 60,
+    cursorFile: "/tmp/unused-cursor.json",
+    maxNotificationsPerCycle: 20,
+    healthHost: "127.0.0.1",
+    healthPort: 0,
+    healthStaleMs: 90_000,
+    channelPreviewMode: false,
+    ...overrides,
+  };
+}
+
+function baseStatus(overrides = {}) {
+  return {
+    running: true, paused: false, startedAt: 1, cycles: 0,
+    lastPollAt: null, lastSuccessAt: null, latestLedger: null,
+    oldestLedger: null, notificationsSent: 0, notificationsFailed: 0,
+    eventsSkipped: 0, eventsDeduplicated: 0, consecutiveFailures: 0,
+    lastError: null, targets: [], stopping: false,
+    pagesScanned: 0, emptyPages: 0, lastCyclePages: 0,
+    lastCycleEmptyPages: 0, restartGaps: 0, cursorRewinds: 0,
+    ...overrides,
+  };
+}
+
+function callbackCtx({ userId, data } = {}) {
+  const answered = [];
+  const edits = [];
+  const replies = [];
+  const ctx = {
+    from: { id: userId },
+    update: { update_id: 1 },
+    callbackQuery: { data, id: "cq-id", message: { date: Math.floor(Date.now() / 1000), chat: { id: -1001234567890 } } },
+    chat: { id: -1001234567890 },
+    api: { sendMessage: async (...a) => { replies.push(a); return {}; } },
+    answerCallbackQuery: async (opts = {}) => { answered.push(opts); },
+    editMessageText: async (text, opts) => { edits.push({ text, opts }); },
+    reply: async (...a) => { replies.push(a); },
+  };
+  return { ctx, answered, edits, replies };
+}
+
+function baseDeps(overrides = {}) {
+  return {
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+    ...overrides,
+  };
+}
+
+function mockedBot(deps) {
+  const commandHandlers = new Map();
+  const bot = {
+    command(name, handler) { commandHandlers.set(name, handler); },
+    callbackQuery() {},
+  };
+  registerCommandHandlers(bot, deps);
+  return { commandHandlers };
+}
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+test("PAUSE_CONFIRM_TTL_MS is exported and positive", () => {
+  assert.ok(typeof PAUSE_CONFIRM_TTL_MS === "number" && PAUSE_CONFIRM_TTL_MS > 0);
+});
+
+test("CALLBACK_PAUSE_CONFIRM fits within Telegram's 64-byte limit", () => {
+  assert.ok(Buffer.byteLength(CALLBACK_PAUSE_CONFIRM, "utf8") <= 64);
+});
+
+test("CALLBACK_PAUSE_CANCEL fits within Telegram's 64-byte limit", () => {
+  assert.ok(Buffer.byteLength(CALLBACK_PAUSE_CANCEL, "utf8") <= 64);
+});
+
+test("TELEGRAM_CALLBACK_DATA_MAX_BYTES is 64", () => {
+  assert.equal(TELEGRAM_CALLBACK_DATA_MAX_BYTES, 64);
+});
+
+// ── validateCallbackData ──────────────────────────────────────────────────────
+
+test("validateCallbackData: direct 'pause' token is accepted", () => {
+  const result = validateCallbackData("pause");
+  assert.equal(result.ok, true);
+  assert.equal(result.action.type, "pause");
+});
+
+test("validateCallbackData: direct 'resume' token is accepted", () => {
+  const result = validateCallbackData("resume");
+  assert.equal(result.ok, true);
+  assert.equal(result.action.type, "resume");
+});
+
+test("validateCallbackData: 'status', 'contracts', 'help' tokens are accepted", () => {
+  for (const token of ["status", "contracts", "help"]) {
+    const result = validateCallbackData(token);
+    assert.equal(result.ok, true, `${token} should be accepted`);
+    assert.equal(result.action.type, token);
+  }
+});
+
+test("validateCallbackData: unknown string returns ok=false with reason", () => {
+  const result = validateCallbackData("bad-action");
+  assert.equal(result.ok, false);
+  assert.ok(typeof result.reason === "string");
+  assert.ok(typeof result.fallbackText === "string");
+});
+
+test("validateCallbackData: undefined returns ok=false", () => {
+  const result = validateCallbackData(undefined);
+  assert.equal(result.ok, false);
+  assert.equal(result.fallbackText, CALLBACK_FALLBACK_FEEDBACK);
+});
+
+test("validateCallbackData: empty string returns ok=false", () => {
+  const result = validateCallbackData("");
+  assert.equal(result.ok, false);
+});
+
+test("validateCallbackData: oversized string (>64 bytes) returns ok=false", () => {
+  const big = "x".repeat(65);
+  const result = validateCallbackData(big);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "exceeds-max-length");
+});
+
+test("validateCallbackData: JSON payload {action:'pause'} is accepted", () => {
+  const result = validateCallbackData(JSON.stringify({ action: "pause" }));
+  assert.equal(result.ok, true);
+  assert.equal(result.action.type, "pause");
+});
+
+test("validateCallbackData: mimir-prefixed colon format is accepted", () => {
+  const result = validateCallbackData("mimir:status");
+  assert.equal(result.ok, true);
+  assert.equal(result.action.type, "status");
+});
+
+// ── operatorKeyboard ──────────────────────────────────────────────────────────
+
+test("operatorKeyboard returns an InlineKeyboard with pause and resume buttons", () => {
+  const kb = operatorKeyboard();
+  const buttons = kb.inline_keyboard.flat();
+  const datas = buttons.map((b) => b.callback_data);
+  assert.ok(datas.includes("pause"), "should include pause button");
+  assert.ok(datas.includes("resume"), "should include resume button");
+});
+
+test("operatorKeyboard button data strings are within Telegram's 64-byte limit", () => {
+  const kb = operatorKeyboard();
+  for (const button of kb.inline_keyboard.flat()) {
+    assert.ok(
+      Buffer.byteLength(button.callback_data, "utf8") <= 64,
+      `Button "${button.callback_data}" exceeds 64 bytes`,
+    );
+  }
+});
+
+// ── handleCallbackQuery — non-operator ───────────────────────────────────────
+
+test("non-operator callback: no pause() call", async () => {
+  let pauseCalls = 0;
+  const deps = baseDeps({ pause: () => { pauseCalls++; return "paused"; } });
+  const { ctx } = callbackCtx({ userId: 99, data: "pause" });
+  await handleCallbackQuery(ctx, deps);
+  assert.equal(pauseCalls, 0);
+});
+
+test("non-operator resume callback: no pause() call", async () => {
+  let pauseCalls = 0;
+  const deps = baseDeps({ pause: () => { pauseCalls++; return "paused"; } });
+  const { ctx } = callbackCtx({ userId: 99, data: "resume" });
+  await handleCallbackQuery(ctx, deps);
+  assert.equal(pauseCalls, 0);
+});
+
+// ── handleCallbackQuery — operator ───────────────────────────────────────────
+
+test("operator pause callback: pause() is called", async () => {
+  let pauseCalls = 0;
+  const deps = baseDeps({ pause: () => { pauseCalls++; return "paused"; } });
+  const { ctx } = callbackCtx({ userId: 42, data: "pause" });
+  await handleCallbackQuery(ctx, deps);
+  assert.equal(pauseCalls, 1);
+});
+
+test("operator resume callback: resume() is called", async () => {
+  let resumeCalls = 0;
+  const deps = baseDeps({ resume: () => { resumeCalls++; return "resumed"; } });
+  const { ctx } = callbackCtx({ userId: 42, data: "resume" });
+  await handleCallbackQuery(ctx, deps);
+  assert.equal(resumeCalls, 1);
+});
+
+// ── handleCallbackQuery — invalid data ───────────────────────────────────────
+
+test("invalid callback data: no pause/resume mutation", async () => {
+  let pauseCalls = 0, resumeCalls = 0;
+  const deps = baseDeps({
+    pause: () => { pauseCalls++; return "paused"; },
+    resume: () => { resumeCalls++; return "resumed"; },
+  });
+  const { ctx } = callbackCtx({ userId: 42, data: "totally-unknown-action" });
+  await handleCallbackQuery(ctx, deps);
+  assert.equal(pauseCalls, 0);
+  assert.equal(resumeCalls, 0);
+});
+
+// ── /pause command ────────────────────────────────────────────────────────────
+
+test("/pause by operator: calls pause() and replies", async () => {
+  let pauseCalls = 0;
+  const { commandHandlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => { pauseCalls++; return "paused"; },
+    resume: () => "resumed",
+  });
+  const replies = [];
+  const ctx = {
+    from: { id: 42 }, update: { update_id: 200 },
+    chat: { id: -1001234567890 },
+    reply: async (...a) => { replies.push(a); },
+  };
+  await commandHandlers.get("pause")(ctx);
+  assert.equal(pauseCalls, 1);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0][0], /paused/i);
+});
+
+test("/pause by non-operator: no reply, no pause() call", async () => {
+  let pauseCalls = 0;
+  const { commandHandlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => { pauseCalls++; return "paused"; },
+    resume: () => "resumed",
+  });
+  const replies = [];
+  const ctx = {
+    from: { id: 99 }, update: { update_id: 201 },
+    chat: { id: -1001234567890 },
+    reply: async (...a) => { replies.push(a); },
+  };
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try { await commandHandlers.get("pause")(ctx); }
+  finally { console.warn = origWarn; }
+  assert.equal(pauseCalls, 0);
+  assert.deepEqual(replies, []);
+});
